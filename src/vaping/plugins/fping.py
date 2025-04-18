@@ -58,6 +58,34 @@ class FPingBase(vaping.plugins.TimedProbe):
 
         self.count = self.config.get("count")
         self.period = self.config.get("period")
+        # Detect version during initialization to avoid repeated checks
+        self._fping_version = self.detect_fping_version()
+        self.log.debug(f"Detected fping version: {self._fping_version}")
+
+    def detect_fping_version(self):
+        """Detect fping version to determine output format parser"""
+        try:
+            args = [self.config["command"], "-v"]
+            # Use self.popen for consistency and potential future benefits (like handling timeouts)
+            with self.popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            ) as proc:
+                # Read all output at once after process finishes
+                version_out, _ = proc.communicate()
+                version_out = version_out.decode("utf-8")
+                if "fping: Version 5" in version_out:
+                    return 5
+                # Add checks for other versions if needed
+                return 4  # Default to 4 if not 5
+        except FileNotFoundError:
+            self.log.critical(f"fping command '{self.config['command']}' not found.")
+            raise
+        except Exception as e:
+            # Log the error and default to a safe version (e.g., 4)
+            self.log.error(
+                f"Failed to detect fping version: {e}. Defaulting to version 4."
+            )
+            return 4
 
     def hosts_args(self):
         """
@@ -133,23 +161,57 @@ class FPingBase(vaping.plugins.TimedProbe):
             return rv
 
         except Exception as e:
-            logging.error(f"failed to get data: {e}")
+            # Log the specific line causing the error for better debugging
+            logging.error(f"Failed to parse fping line '{line.strip()}': {e}")
+            return None  # Return None to indicate parsing failure for this line
 
     def _run_proc(self):
         args = [
             self.config["command"],
-            "-u",
-            "-C%d" % self.count,
-            "-p%d" % self.period,
-            "-e",
+            "-u",  # Unreachable hosts
+            "-C%d" % self.count,  # Count
+            "-p%d" % self.period,  # Period
+            "-e",  # Elapsed time
         ]
+
+        # Conditionally add -q for fping version 5
+        if self._fping_version == 5:
+            args.append(
+                "-q"
+            )  # Quiet mode (suppresses per-probe results, shows summary)
+
         args.extend(self.hosts_args())
         data = list()
 
+        self.log.debug(f"Running fping command: {' '.join(args)}")
+
         # get both stdout and stderr
-        with self.popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as proc:
-            for line in iter(proc.stdout.readline, b""):
-                data.append(self.parse_verbose(line.decode("utf-8")))
+        try:
+            with self.popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            ) as proc:
+                for line in iter(proc.stdout.readline, b""):
+                    decoded_line = line.decode("utf-8")
+                    parsed_data = self.parse_verbose(decoded_line)
+                    if parsed_data:  # Only append if parsing was successful
+                        data.append(parsed_data)
+                # Check process exit code after reading output
+                proc.wait()
+                if proc.returncode != 0:
+                    self.log.warning(
+                        f"fping process exited with code {proc.returncode}"
+                    )
+
+        except FileNotFoundError:
+            self.log.critical(
+                f"fping command '{self.config['command']}' not found during execution."
+            )
+            # Re-raise or handle appropriately, maybe return empty data or specific error message
+            raise
+        except Exception as e:
+            self.log.error(f"Error running or processing fping: {e}")
+            # Depending on desired behavior, you might return partial data or empty list
+            return []  # Return empty list on error
 
         return data
 
@@ -176,5 +238,13 @@ class FPing(FPingBase):
 
     def probe(self):
         msg = self.new_message()
-        msg["data"] = self._run_proc()
-        return msg
+        # Run the fping process and get parsed data
+        proc_data = self._run_proc()
+        # Filter out any None results from parsing errors or ignored lines
+        msg["data"] = [d for d in proc_data if d is not None]
+        # Only return message if there's valid data
+        if msg["data"]:
+            return msg
+        else:
+            self.log.warning("No valid data returned from fping process.")
+            return None
